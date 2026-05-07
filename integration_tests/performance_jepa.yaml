@@ -1,0 +1,9 @@
+train_logging:
+  track_performance_metrics: True
+
+training_config:
+  num_mini_epochs: 1
+  samples_per_mini_epoch: 800
+
+validation_config:
+  samples_per_mini_epoch: 5
