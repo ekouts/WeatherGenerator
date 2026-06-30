@@ -95,6 +95,9 @@ class StreamEmbedTransformer(torch.nn.Module):
             self.ln_final = torch.nn.ModuleList(
                 [norm(dim_embed, eps=1e-6) for _ in range(num_channels)]
             )
+            # LayerNorm has weight+bias, RMSNorm has weight only; used to pick the vectorized
+            # normalization in _unembed_block().
+            self._block_norm_is_layernorm = norm is torch.nn.LayerNorm
         else:
             raise ValueError(f"Unknown unembed mode: {unembed_mode}")
 
@@ -113,11 +116,7 @@ class StreamEmbedTransformer(torch.nn.Module):
         if self.unembed_mode == "full":
             out = self.unembed(self.ln_final(x.flatten(-2, -1)))
         elif self.unembed_mode == "block":
-            out = [
-                ue(ln(x[:, i]))
-                for i, (ue, ln) in enumerate(zip(self.unembed, self.ln_final, strict=True))
-            ]
-            out = torch.stack(out, dim=1).flatten(-2, -1)
+            out = self._unembed_block(x)
         else:
             raise ValueError(f"Unknown unembed mode: {self.unembed_mode}")
 
@@ -127,6 +126,49 @@ class StreamEmbedTransformer(torch.nn.Module):
         out = self.dropout_final(out.reshape(-1, self.num_tokens, self.dim_out))
 
         return out
+
+    def _unembed_block(self, x):
+        """Vectorized per-channel block unembedding (norm + linear).
+
+        Replaces the Python loop over the ``ln_final`` / ``unembed`` ModuleLists with batched
+        ops over the channel dimension: one normalization + one batched matmul instead of
+        ``2 * num_channels`` small kernels. Numerically equivalent to the loop; parameters stay
+        in the ModuleLists so checkpoints are unchanged.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``[N, num_channels, dim_embed]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[N, num_channels * dim_out_per_channel]``.
+        """
+        # per-channel normalization, vectorized over the channel dim
+        norm_w = torch.stack([n.weight for n in self.ln_final])  # [C, D]
+        if self._block_norm_is_layernorm:
+            norm_b = torch.stack([n.bias for n in self.ln_final])  # [C, D]
+            xn = torch.nn.functional.layer_norm(x, (x.shape[-1],), eps=self.ln_final[0].eps)
+            xn = xn * norm_w + norm_b
+        else:  # RMSNorm: normalize in fp32, cast back, scale by weight (no bias)
+            xf = x.float()
+            xn = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.ln_final[0].eps)
+            xn = xn.type_as(x) * norm_w
+
+        # per-channel linear, batched matmul over the channel dim. torch.einsum does not honor
+        # autocast, so cast explicitly to the autocast compute dtype to match what the
+        # per-channel nn.Linear produced (e.g. bf16). Otherwise an fp32 output breaks the
+        # downstream bf16 scatter in EmbeddingEngine.forward.
+        if torch.is_autocast_enabled(x.device.type):
+            compute_dtype = torch.get_autocast_dtype(x.device.type)
+        else:
+            compute_dtype = xn.dtype
+        lin_w = torch.stack([u.weight for u in self.unembed]).to(compute_dtype)  # [C, dim_out, D]
+        lin_b = torch.stack([u.bias for u in self.unembed]).to(compute_dtype)  # [C, dim_out]
+        out = torch.einsum("ncd,cod->nco", xn.to(compute_dtype), lin_w) + lin_b  # [N, C, dim_out]
+
+        return out.flatten(-2, -1)
 
 
 class StreamEmbedLinear(torch.nn.Module):
