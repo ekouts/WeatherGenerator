@@ -23,7 +23,7 @@ WORKDIR /opt/weathergen
 
 RUN uv venv --system-site-packages --python "$(command -v python3)" /opt/venv \
  && uv sync --no-dev \
- && python -c "import torch, weathergen; print('torch', torch.__version__)"
+ && /opt/venv/bin/python -c "import torch, weathergen; print('torch', torch.__version__)"
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH
