@@ -1,0 +1,29 @@
+# WeatherGenerator on top of a CSCS Alps Extended Image (NGC PyTorch + Slingshot stack).
+# Experimental Transformer Engine track; kept separate from the uenv+venv workflow.
+#
+# Build on Santis (see container/README.md):
+#   podman build -f container/Containerfile -t wg-te:26.02-alps6 .
+
+ARG BASE_IMAGE=ghcr.io/eth-cscs/alps-extended-images/ngc-pytorch:26.02-py3-alps6
+FROM ${BASE_IMAGE}
+
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /usr/local/bin/
+
+# The venv is created with --system-site-packages so it sees the NGC stack
+# (torch, flash-attn, TransformerEngine, cuDNN — version-matched by NVIDIA).
+# The gpu/cpu extras are deliberately NOT installed: torch and flash-attn must
+# come from the base image. The base dependency closure contains no
+# torch/cuda packages (verified with `uv export`).
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy
+
+COPY . /opt/weathergen
+WORKDIR /opt/weathergen
+
+RUN uv venv --system-site-packages --python "$(command -v python3)" /opt/venv \
+ && uv sync --no-dev \
+ && python -c "import torch, weathergen; print('torch', torch.__version__)"
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
