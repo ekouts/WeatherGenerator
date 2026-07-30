@@ -43,6 +43,7 @@ model or the complete training step.
 | spatial group | Consecutive ranks that consume the same sample and partition its HEALPix domain |
 | data-parallel rank | Index of a spatial group in the global job |
 | spatial rank | Rank index within a spatial group |
+| `SpatialShard` | The single definition of which HEALPix cells a spatial rank owns |
 | data HEALPix level | The configured `healpix_level`, normally level 5 |
 | parent level | Coarser HEALPix level whose complete cells must remain rank-local |
 | packed tokens | Variable-length tensor containing only existing stream tokens |
@@ -156,10 +157,42 @@ descendants on one rank.
 
 `get_encoder_spatial_parallel_group()` creates process groups from consecutive global ranks.
 All global ranks create the groups in the same order, and each process caches the group that
-contains it.
+contains it. The in-group index it returns comes from `get_encoder_spatial_parallel_rank()`,
+which is the only place that computes `global_rank % spatial_parallel_size`.
 
 With spatial size one, no additional process group is created and the feature reduces to the
 single-rank compatibility behavior.
+
+## Cell ownership is defined once
+
+`SpatialShard` (`src/weathergen/datasets/healpix_domain.py`) is the only place that turns
+`(num_cells, spatial_parallel_size, spatial rank)` into an owned cell range. Both
+`MultiStreamDataSampler` and `EncoderModule` build one via `SpatialShard.for_rank()` and read
+`start`, `end`, `local_num_cells`, `size`, and `is_sharded` from it; neither recomputes the
+arithmetic. It also owns the divisibility check, so the sampler and the encoder cannot disagree
+about which cells a rank is responsible for.
+
+The shard is deliberately pure config arithmetic with no `torch.distributed` dependency. This
+matters because `MultiStreamDataSampler` is pickled into dataloader worker processes that have
+no process group, whereas the encoder does have one. The `ProcessGroup` itself therefore stays
+on the encoder as `spatial_parallel_group`, and only the spatial rank index is passed into
+`SpatialShard.for_rank()`.
+
+The spatial rank is likewise defined once, by `get_encoder_spatial_parallel_rank()`. Spatial
+groups are built from consecutive *global* ranks, so `dist.get_rank()` is authoritative and
+neither caller recomputes `global_rank % spatial_parallel_size`;
+`get_encoder_spatial_parallel_group()` returns the value from that same helper.
+
+`cf.rank` remains the basis for data sharding (`self.rank = cf.rank // spatial_parallel_size`),
+so it must agree with the distributed rank. `TrainerBase.init_ddp()` now raises if it does not,
+instead of letting a rank's data loader and its encoder operate on different HEALPix domains.
+This is a reachable state, not a theoretical one: `init_ddp()` skips its rank-discovery branch
+when the process group was already initialized elsewhere, which would otherwise leave `cf.rank`
+at `0` on every rank while `dist.get_rank()` is correct.
+
+If cell ownership ever stops being a uniform contiguous split — for example if parent-aligned
+ownership returns — the encoder can no longer reconstruct the range from rank arithmetic, and
+the shard must instead travel on `ModelBatch` from the sampler.
 
 ## End-to-end data flow
 
@@ -269,7 +302,7 @@ For each local source cell:
 `StreamData` is initialized with:
 
 ```text
-source HEALPix cells = local_num_healpix_cells
+source HEALPix cells = spatial_shard.local_num_cells
 target HEALPix cells = num_healpix_cells
 ```
 
@@ -397,7 +430,7 @@ cell. Before gathering, every rank restores a dense local tensor:
 ```text
 [
     input_steps × samples,
-    local_num_healpix_cells,
+    spatial_shard.local_num_cells,
     local_queries_per_cell,
     global_embedding_dimension,
 ]
@@ -484,7 +517,7 @@ and retain an explicit raw observation identifier for inverse mapping.
 
 The encoder accepts either:
 
-- a rank-local source batch with `local_num_healpix_cells`; or
+- a rank-local source batch with `spatial_shard.local_num_cells`; or
 - a legacy global source batch with `num_healpix_cells`.
 
 For a local batch, the embedding result is already local.
@@ -654,6 +687,8 @@ Compare:
 
 | Test area | Invariant |
 | --- | --- |
+| Shard tiling | Per-rank shards tile every cell exactly once, in order |
+| Shard validation | Indivisible sizes and out-of-range ranks are rejected |
 | Local construction equivalence | Concatenated local cell lists equal global construction cell-by-cell |
 | Invalid local range | Out-of-range cell intervals are rejected |
 | Parent alignment | Every descendant of a level-1 parent has one rank owner |
@@ -663,6 +698,8 @@ Compare:
 | Coverage and gradients | Shards cover every packed token exactly once and preserve gradients |
 | Invalid packed ranges | Invalid cell intervals are rejected |
 | Distributed size validation | Spatial groups must divide the distributed world |
+| Spatial rank derivation | Global ranks wrap to in-group indices; unsharded runs are always rank 0 |
+| Sampler/encoder agreement | One global rank resolves to exactly one shard on both sides |
 
 Recommended validation commands are:
 
@@ -773,7 +810,7 @@ Confirm that:
 | `config/default_config.yml` | Default spatial size and parent level |
 | `config/encoder_spatial_parallel_4.yml` | Four-rank override |
 | `config/encoder_spatial_parallel_8.yml` | Eight-rank override |
-| `src/weathergen/datasets/healpix_domain.py` | Parent-aligned cell ranges and local point grouping |
+| `src/weathergen/datasets/healpix_domain.py` | `SpatialShard` cell ownership, parent-aligned cell ranges, and local point grouping |
 | `src/weathergen/datasets/multi_stream_data_sampler.py` | Shared spatial-group samples, local ownership, and runtime logging |
 | `src/weathergen/datasets/stream_data.py` | Separate source-local and target-global cell counts |
 | `src/weathergen/datasets/tokenizer_masking.py` | Local source tokenization range |
@@ -782,7 +819,8 @@ Confirm that:
 | `src/weathergen/model/spatial_parallel.py` | Legacy packed-token shard selection |
 | `src/weathergen/model/encoder.py` | Local assimilation, local-to-global projection, and differentiable gather |
 | `src/weathergen/train/trainer.py` | Effective data-parallel batch and scheduler semantics |
-| `src/weathergen/utils/distributed.py` | Spatial group validation and construction |
+| `src/weathergen/train/trainer_base.py` | Enforces that `cf.rank` matches the distributed rank |
+| `src/weathergen/utils/distributed.py` | Spatial group validation, construction, and in-group rank |
 | `tests/test_encoder_spatial_parallel.py` | Cell ownership, ordering, coverage, validation, and gradient tests |
 
 ## Commit-by-commit design history

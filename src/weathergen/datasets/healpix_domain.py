@@ -7,7 +7,71 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass(frozen=True)
+class SpatialShard:
+    """The consecutive HEALPix-cell range owned by one encoder-spatial rank.
+
+    This is the single definition of encoder cell ownership. It is deliberately
+    pure config arithmetic with no ``torch.distributed`` involvement, so that the
+    data sampler (which is pickled into dataloader workers that have no process
+    group) and the encoder (which does have one) derive the same range from the
+    same formula instead of each reimplementing it.
+    """
+
+    #: number of ranks cooperating on one encoder input
+    size: int
+    #: rank within the spatial-parallel group, in ``[0, size)``
+    rank: int
+    #: total number of HEALPix cells at the encoder's level
+    num_cells: int
+    #: first cell owned by this rank
+    start: int
+    #: one past the last cell owned by this rank
+    end: int
+
+    @property
+    def local_num_cells(self) -> int:
+        """Number of cells owned by this rank."""
+
+        return self.end - self.start
+
+    @property
+    def is_sharded(self) -> bool:
+        """Whether cells are split across more than one rank."""
+
+        return self.size > 1
+
+    @classmethod
+    def for_rank(cls, num_cells: int, size: int, rank: int) -> "SpatialShard":
+        """Build the shard owned by ``rank`` in a group of ``size`` ranks."""
+
+        if size < 1:
+            raise ValueError(f"encoder_spatial_parallel_size ({size}) must be at least 1")
+        if not 0 <= rank < size:
+            raise ValueError(
+                f"encoder spatial rank ({rank}) out of range for "
+                f"encoder_spatial_parallel_size ({size})"
+            )
+        if num_cells % size:
+            raise ValueError(
+                f"number of HEALPix cells ({num_cells}) must be divisible by "
+                f"encoder_spatial_parallel_size ({size})"
+            )
+
+        local_num_cells = num_cells // size
+        start = rank * local_num_cells
+        return cls(
+            size=size,
+            rank=rank,
+            num_cells=num_cells,
+            start=start,
+            end=start + local_num_cells,
+        )
 
 
 def build_local_healpix_cell_splits(
