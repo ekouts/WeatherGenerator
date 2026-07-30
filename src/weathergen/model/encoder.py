@@ -192,7 +192,7 @@ class EncoderModule(torch.nn.Module):
         # HEALPix cells. Process that shard in one call so every spatial rank
         # enters the local FSDP modules the same number of times.
         num_cells_per_sample = num_cells_per_sample or self.num_healpix_cells
-        if self.spatial_shard.size > 1:
+        if self.spatial_shard.is_sharded:
             clen = num_cells_per_sample
         else:
             clen = self.num_healpix_cells // (2 if self.cf.healpix_level <= 5 else 8)
@@ -339,14 +339,14 @@ class EncoderModule(torch.nn.Module):
 
         tokens_lens_global = batch.tokens_lens
         batch_num_cells = tokens_lens_global.shape[-1]
-        if batch_num_cells !=  self.spatial_shard.local_num_cells:
+        if batch_num_cells != self.spatial_shard.local_num_cells:
             raise ValueError(
                 f"batch has {batch_num_cells} HEALPix cells; expected "
                 f"{self.spatial_shard.local_num_cells} rank-local cells"
             )
-        if self.spatial_shard.size > 1:
+        if self.spatial_shard.is_sharded:
             tokens_lens_global = torch.cat(
-                all_gather(tokens_lens_global, group=self.spatial_shard.group),
+                all_gather(tokens_lens_global, group=self.spatial_parallel_group),
                 dim=-1,
             )
         cell_lens = torch.sum(tokens_lens_global, 2).flatten()
@@ -396,9 +396,9 @@ class EncoderModule(torch.nn.Module):
             self.q_cells.shape[-2],
             self.q_cells.shape[-1],
         )
-        if self.spatial_shard.size > 1:
+        if self.spatial_shard.is_sharded:
             tokens_global = torch.cat(
-                all_gather(tokens_global, group=self.spatial_shard.group),
+                all_gather(tokens_global, group=self.spatial_parallel_group),
                 dim=1,
             )
 
