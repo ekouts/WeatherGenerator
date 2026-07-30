@@ -26,7 +26,6 @@ from weathergen.model.engines import (
 # from weathergen.model.model import ModelParams
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.positional_encoding import positional_encoding_harmonic
-from weathergen.model.spatial_parallel import select_packed_cell_shard
 from weathergen.utils.distributed import (
     get_encoder_spatial_parallel_group,
     get_encoder_spatial_parallel_size,
@@ -144,33 +143,13 @@ class EncoderModule(torch.nn.Module):
             self.embed_engine, batch, model_params.pe_embed, use_reentrant=False
         )
         cell_lens = torch.sum(batch.tokens_lens, 2).flatten()
-        batch_num_cells = batch.tokens_lens.shape[-1]
-        if batch_num_cells == self.local_num_healpix_cells:
-            # The data pipeline already constructed only this rank's HEALPix
-            # cells, so its packed tokens are local without another selection.
-            local_cell_lens = cell_lens
-        elif batch_num_cells == self.num_healpix_cells:
-            # Backward-compatible path for batches constructed with the full
-            # global grid.
-            stream_cell_tokens, local_cell_lens = select_packed_cell_shard(
-                stream_cell_tokens,
-                cell_lens,
-                self.num_healpix_cells,
-                self.local_cell_start,
-                self.local_cell_end,
-            )
-        else:
-            raise ValueError(
-                f"batch has {batch_num_cells} HEALPix cells; expected either "
-                f"{self.local_num_healpix_cells} local or {self.num_healpix_cells} global cells"
-            )
 
         tokens_global, posteriors = checkpoint(
             self.assimilate_local,
             model_params,
             stream_cell_tokens,
             batch,
-            local_cell_lens,
+            cell_lens,
             use_reentrant=False,
         )
 
@@ -395,16 +374,7 @@ class EncoderModule(torch.nn.Module):
         # Direct calls retain the old API and perform the shard selection here.
         # ``forward`` passes an already-sharded stream_cell_tokens tensor.
         if cell_lens_local is None:
-            if batch_num_cells == self.local_num_healpix_cells:
-                cell_lens_local = torch.sum(batch.tokens_lens, 2).flatten()
-            else:
-                tokens, cell_lens_local = select_packed_cell_shard(
-                    tokens,
-                    cell_lens,
-                    self.num_healpix_cells,
-                    self.local_cell_start,
-                    self.local_cell_end,
-                )
+            cell_lens_local = torch.sum(batch.tokens_lens, 2).flatten()
 
         pe_global_local = model_params.pe_global[self.local_cell_start : self.local_cell_end]
 
