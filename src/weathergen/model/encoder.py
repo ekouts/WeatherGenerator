@@ -331,7 +331,7 @@ class EncoderModule(torch.nn.Module):
         model_params,
         tokens: torch.Tensor,
         batch: ModelBatch,
-        cell_lens_local: torch.Tensor | None = None,
+        cell_lens_local: torch.Tensor,
     ) -> torch.Tensor:
         """
         Processes embedded tokens locally and prepares them for the global assimilation
@@ -339,27 +339,23 @@ class EncoderModule(torch.nn.Module):
         Args:
             model_params : Query and embedding parameters
             tokens : Input tokens to be processed by local assimilation
-            cell_lens : Used to identify range of tokens to use from generated tokens in cell
-                embedding
+            cell_lens_local : Used to identify range of tokens to use from generated tokens in
+                cell embedding
         Returns:
             Tokens for global assimilation
         """
 
         tokens_lens_global = batch.tokens_lens
         batch_num_cells = tokens_lens_global.shape[-1]
-        if batch_num_cells == self.local_num_healpix_cells:
-            if self.spatial_parallel_size > 1:
-                tokens_lens_global = torch.cat(
-                    all_gather(
-                        tokens_lens_global,
-                        group=self.spatial_parallel_group,
-                    ),
-                    dim=-1,
-                )
-        elif batch_num_cells != self.num_healpix_cells:
+        if batch_num_cells != self.local_num_healpix_cells:
             raise ValueError(
-                f"batch has {batch_num_cells} HEALPix cells; expected either "
-                f"{self.local_num_healpix_cells} local or {self.num_healpix_cells} global cells"
+                f"batch has {batch_num_cells} HEALPix cells; expected "
+                f"{self.local_num_healpix_cells} rank-local cells"
+            )
+        if self.spatial_parallel_size > 1:
+            tokens_lens_global = torch.cat(
+                all_gather(tokens_lens_global, group=self.spatial_parallel_group),
+                dim=-1,
             )
         cell_lens = torch.sum(tokens_lens_global, 2).flatten()
 
@@ -370,11 +366,6 @@ class EncoderModule(torch.nn.Module):
         num_extra_tokens = self.num_register_tokens + self.num_class_tokens
         pos_enc = positional_encoding_harmonic
         tokens_global_register_class = pos_enc(self.q_cells.repeat(rs, num_extra_tokens, 1))
-
-        # Direct calls retain the old API and perform the shard selection here.
-        # ``forward`` passes an already-sharded stream_cell_tokens tensor.
-        if cell_lens_local is None:
-            cell_lens_local = torch.sum(batch.tokens_lens, 2).flatten()
 
         pe_global_local = model_params.pe_global[self.local_cell_start : self.local_cell_end]
 
