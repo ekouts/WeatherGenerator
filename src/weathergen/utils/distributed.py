@@ -79,6 +79,21 @@ def get_encoder_spatial_parallel_size(cf) -> int:
     return size
 
 
+def get_encoder_spatial_parallel_rank(cf) -> int:
+    """Return this process' index within its encoder-spatial group.
+
+    Single definition of the in-group index. Spatial groups are built from
+    consecutive *global* ranks, so the distributed rank is authoritative here;
+    ``cf.rank`` is only equivalent because ``init_ddp`` checks that it is.
+    """
+
+    size = get_encoder_spatial_parallel_size(cf)
+    if size == 1:
+        return 0
+
+    return get_rank() % size
+
+
 def get_encoder_spatial_parallel_group(cf) -> tuple[dist.ProcessGroup | None, int]:
     """Create the consecutive-rank process groups used to shard HEALPix cells.
 
@@ -106,7 +121,7 @@ def get_encoder_spatial_parallel_group(cf) -> tuple[dist.ProcessGroup | None, in
             own_group = group
 
     assert own_group is not None
-    result = (own_group, global_rank % size)
+    result = (own_group, get_encoder_spatial_parallel_rank(cf))
     _ENCODER_SPATIAL_GROUPS[size] = result
     return result
 
