@@ -330,36 +330,54 @@ class ModelBatch:
 
     def unique_tensor_storage_bytes(self) -> int:
         """Return bytes owned by unique tensor storages referenced by this batch."""
-        storages: dict[tuple[str, int | None, int, int], int] = {}
+        return sum(self.unique_tensor_storage_bytes_by_component().values())
 
-        def add_tensors(value) -> None:
+    def unique_tensor_storage_bytes_by_component(self) -> dict[str, int]:
+        """Return unique tensor-storage bytes grouped by batch role, stream, and field.
+
+        A storage referenced by more than one component is counted once in ``shared``.
+        Repeated references within the same component remain attributed to that component.
+        """
+        storage_bytes: dict[tuple[str, int | None, int, int], int] = {}
+        storage_components: dict[tuple[str, int | None, int, int], set[str]] = {}
+
+        def add_tensors(value, component: str) -> None:
             if isinstance(value, torch.Tensor):
                 storage = value.untyped_storage()
-                storage_bytes = storage.nbytes()
+                num_bytes = storage.nbytes()
                 key = (
                     value.device.type,
                     value.device.index,
                     storage.data_ptr(),
-                    storage_bytes,
+                    num_bytes,
                 )
-                storages[key] = storage_bytes
+                storage_bytes[key] = num_bytes
+                storage_components.setdefault(key, set()).add(component)
             elif isinstance(value, dict):
                 for item in value.values():
-                    add_tensors(item)
+                    add_tensors(item, component)
             elif isinstance(value, list | tuple):
                 for item in value:
-                    add_tensors(item)
+                    add_tensors(item, component)
 
-        for batch_samples in (self.source_samples, self.target_samples):
-            add_tensors(batch_samples.tokens_lens)
+        for role, batch_samples in (
+            ("source", self.source_samples),
+            ("target", self.target_samples),
+        ):
+            add_tensors(batch_samples.tokens_lens, f"{role}._batch.tokens_lens")
             for sample in batch_samples.samples:
-                for metadata in sample.meta_info.values():
-                    add_tensors(metadata.mask)
-                for stream_data in sample.streams_data.values():
+                for stream_name, metadata in sample.meta_info.items():
+                    add_tensors(metadata.mask, f"{role}.{stream_name}.metadata.mask")
+                for stream_name, stream_data in sample.streams_data.items():
                     if stream_data is not None:
-                        add_tensors(vars(stream_data))
+                        for field_name, value in vars(stream_data).items():
+                            add_tensors(value, f"{role}.{stream_name}.{field_name}")
 
-        return sum(storages.values())
+        component_bytes: dict[str, int] = {}
+        for key, components in storage_components.items():
+            component = next(iter(components)) if len(components) == 1 else "shared"
+            component_bytes[component] = component_bytes.get(component, 0) + storage_bytes[key]
+        return dict(sorted(component_bytes.items()))
 
     def pin_memory(self):
         """Pin all tensors in this batch to CPU pinned memory"""

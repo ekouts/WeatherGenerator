@@ -24,6 +24,7 @@ from torch.distributed.tensor import DTensor
 
 import weathergen.common.config as config
 from weathergen.common.config import Config
+from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.model_interface import (
@@ -58,6 +59,21 @@ from weathergen.utils.validation_io import write_output
 logger = logging.getLogger(__name__)
 
 # cfg_keys_to_filter = ["losses", "model_input", "target_input"]
+
+
+def _batch_timeline_values(batch: ModelBatch) -> dict[str, int]:
+    component_bytes = batch.unique_tensor_storage_bytes_by_component()
+    values = {
+        "temporal_index": batch.temporal_index,
+        "batch_unique_tensor_storage_bytes": sum(component_bytes.values()),
+    }
+    values.update(
+        {
+            f"batch_storage_bytes.{component}": num_bytes
+            for component, num_bytes in component_bytes.items()
+        }
+    )
+    return values
 
 
 class Trainer(TrainerBase):
@@ -508,12 +524,10 @@ class Trainer(TrainerBase):
                 batch = next(dataset_iter)
             except StopIteration:
                 break
+            batch_timeline_values: dict[str, int] = {}
             if self.cgroup_memory_timeline is not None:
                 batch_dequeued_ns = time.monotonic_ns()
-                batch_timeline_values = {
-                    "temporal_index": batch.temporal_index,
-                    "batch_unique_tensor_storage_bytes": batch.unique_tensor_storage_bytes(),
-                }
+                batch_timeline_values = _batch_timeline_values(batch)
                 self.cgroup_memory_timeline.record_stage(
                     "batch_dequeued",
                     monotonic_ns=batch_dequeued_ns,
@@ -534,12 +548,7 @@ class Trainer(TrainerBase):
                     batch = batch.pin_memory()
                     if self.cgroup_memory_timeline is not None:
                         pin_end_ns = time.monotonic_ns()
-                        batch_timeline_values = {
-                            "temporal_index": batch.temporal_index,
-                            "batch_unique_tensor_storage_bytes": (
-                                batch.unique_tensor_storage_bytes()
-                            ),
-                        }
+                        batch_timeline_values = _batch_timeline_values(batch)
                         self.cgroup_memory_timeline.record_stage(
                             "pin_end",
                             monotonic_ns=pin_end_ns,
@@ -558,10 +567,7 @@ class Trainer(TrainerBase):
                 batch.to_device(self.device)
                 if self.cgroup_memory_timeline is not None:
                     h2d_enqueued_ns = time.monotonic_ns()
-                    batch_timeline_values = {
-                        "temporal_index": batch.temporal_index,
-                        "batch_unique_tensor_storage_bytes": batch.unique_tensor_storage_bytes(),
-                    }
+                    batch_timeline_values = _batch_timeline_values(batch)
                     self.cgroup_memory_timeline.record_stage(
                         "h2d_enqueued",
                         monotonic_ns=h2d_enqueued_ns,
