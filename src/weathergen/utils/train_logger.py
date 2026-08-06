@@ -11,6 +11,7 @@ import datetime
 import json
 import logging
 import math
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ class TrainLogger:
     def __init__(self, cf, path_run: Path) -> None:
         self.cf = cf
         self.path_run = path_run
+        self._write_lock = threading.Lock()
 
     def log_metrics(self, stage: Stage, metrics: dict[str, float], step: int | None = None) -> None:
         """
@@ -88,7 +90,7 @@ class TrainLogger:
         metrics_path = get_train_metrics_path(
             base_path=config.get_path_run(self.cf), run_id=self.cf.general.run_id
         )
-        with open(metrics_path, "ab") as f:
+        with self._write_lock, open(metrics_path, "ab") as f:
             s = json.dumps(clean_metrics) + "\n"
             f.write(s.encode("utf-8"))
 

@@ -36,6 +36,7 @@ from weathergen.train.lr_scheduler import LearningRateScheduler
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
+    SYSTEM,
     TRAIN,
     VAL,
     NoOpGradScaler,
@@ -47,6 +48,7 @@ from weathergen.train.utils import (
     get_batch_size_from_config,
     get_target_idxs_from_cfg,
 )
+from weathergen.utils.cgroup_memory import CgroupMemoryTimeline
 from weathergen.utils.distributed import get_encoder_spatial_parallel_size, is_root
 from weathergen.utils.performance import NullThroughputTracker, ThroughputTracker, nvtx_range
 from weathergen.utils.train_logger import TrainLogger, prepare_losses_for_logging
@@ -88,6 +90,7 @@ class Trainer(TrainerBase):
         self.batch_size_test_per_gpu = -1
         self.collapse_monitor: CollapseMonitor | None = None
         self.perf_tracker: ThroughputTracker | NullThroughputTracker = NullThroughputTracker()
+        self.cgroup_memory_timeline: CgroupMemoryTimeline | None = None
         self.t_training_start: float = 0
         self.training_loop_annotation_context = contextlib.nullcontext
 
@@ -173,6 +176,18 @@ class Trainer(TrainerBase):
             config.get_path_model(cf).mkdir(exist_ok=True, parents=True)
 
         self.train_logger = TrainLogger(cf, config.get_path_run(self.cf))
+
+        timeline_cfg = cf.train_logging.get("cgroup_memory_timeline", {})
+        if timeline_cfg.get("enabled", False) and is_root():
+            self.cgroup_memory_timeline = CgroupMemoryTimeline(
+                log_fn=lambda metrics: self.train_logger.log_metrics(SYSTEM, metrics),
+                sampling_interval_ms=timeline_cfg.get("sampling_interval_ms", 100),
+            )
+            logger.info(
+                "Cgroup memory timeline will sample %s every %d ms",
+                self.cgroup_memory_timeline.cgroup_path,
+                timeline_cfg.get("sampling_interval_ms", 100),
+            )
 
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
@@ -456,31 +471,76 @@ class Trainer(TrainerBase):
         cf = self.cf
         self.model.train()
 
+        if self.cgroup_memory_timeline is not None:
+            self.cgroup_memory_timeline.start()
+            self.cgroup_memory_timeline.record_stage("train_start", mini_epoch=mini_epoch)
+
         apply_fct_to_blocks(self.model, cf.freeze_modules, set_to_eval)
 
+        if self.cgroup_memory_timeline is not None:
+            self.cgroup_memory_timeline.record_stage("dataloader_iter_start", mini_epoch=mini_epoch)
         dataset_iter = iter(self.data_loader)
+        if self.cgroup_memory_timeline is not None:
+            self.cgroup_memory_timeline.record_stage("dataloader_iter_ready", mini_epoch=mini_epoch)
 
         self.optimizer.zero_grad()
 
         # training loop
         self.t_start = time.time()
-        for bidx, batch in enumerate(dataset_iter):
+        bidx = 0
+        while True:
+            if self.cgroup_memory_timeline is not None:
+                self.cgroup_memory_timeline.record_stage(
+                    "dequeue_start", mini_epoch=mini_epoch, batch_index=bidx
+                )
+            try:
+                batch = next(dataset_iter)
+            except StopIteration:
+                break
+            if self.cgroup_memory_timeline is not None:
+                self.cgroup_memory_timeline.record_stage(
+                    "batch_dequeued", mini_epoch=mini_epoch, batch_index=bidx
+                )
             with self.training_loop_annotation_context(f"batch_{bidx}"):
                 if cf.data_loading.get("memory_pinning", False):
                     # pin memory for faster CPU-GPU transfer
+                    if self.cgroup_memory_timeline is not None:
+                        self.cgroup_memory_timeline.record_stage(
+                            "pin_start", mini_epoch=mini_epoch, batch_index=bidx
+                        )
                     batch = batch.pin_memory()
+                    if self.cgroup_memory_timeline is not None:
+                        self.cgroup_memory_timeline.record_stage(
+                            "pin_end", mini_epoch=mini_epoch, batch_index=bidx
+                        )
 
+                if self.cgroup_memory_timeline is not None:
+                    self.cgroup_memory_timeline.record_stage(
+                        "h2d_start", mini_epoch=mini_epoch, batch_index=bidx
+                    )
                 batch.to_device(self.device)
+                if self.cgroup_memory_timeline is not None:
+                    self.cgroup_memory_timeline.record_stage(
+                        "h2d_enqueued", mini_epoch=mini_epoch, batch_index=bidx
+                    )
 
                 with torch.autocast(
                     device_type=f"cuda:{cf.local_rank}",
                     dtype=self.mixed_precision_dtype,
                     enabled=cf.with_mixed_precision,
                 ):
+                    if self.cgroup_memory_timeline is not None:
+                        self.cgroup_memory_timeline.record_stage(
+                            "forward_start", mini_epoch=mini_epoch, batch_index=bidx
+                        )
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),
                     )
+                    if self.cgroup_memory_timeline is not None:
+                        self.cgroup_memory_timeline.record_stage(
+                            "forward_end", mini_epoch=mini_epoch, batch_index=bidx
+                        )
 
                     targets_and_auxs = {}
                     for loss_name, target_aux in self.target_and_aux_calculators.items():
@@ -518,6 +578,10 @@ class Trainer(TrainerBase):
                 # backward pass
                 self.optimizer.zero_grad()
                 self.grad_scaler.scale(loss).backward()
+                if self.cgroup_memory_timeline is not None:
+                    self.cgroup_memory_timeline.record_stage(
+                        "backward_end", mini_epoch=mini_epoch, batch_index=bidx
+                    )
 
                 # gradient clipping
                 self.grad_scaler.unscale_(self.optimizer)
@@ -535,6 +599,10 @@ class Trainer(TrainerBase):
                 # optimizer step
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
+                if self.cgroup_memory_timeline is not None:
+                    self.cgroup_memory_timeline.record_stage(
+                        "optimizer_end", mini_epoch=mini_epoch, batch_index=bidx
+                    )
 
                 # update learning rate
                 self.lr_scheduler.step()
@@ -584,8 +652,12 @@ class Trainer(TrainerBase):
                 self.save_model(-1)
 
             self.cf.general.istep += 1
+            bidx += 1
 
         self.dataset.advance()
+        if self.cgroup_memory_timeline is not None:
+            self.cgroup_memory_timeline.record_stage("train_end", mini_epoch=mini_epoch)
+            self.cgroup_memory_timeline.stop()
 
     def validate(self, mini_epoch, mode_cfg, batch_size):
         """
