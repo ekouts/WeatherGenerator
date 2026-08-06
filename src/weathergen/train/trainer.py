@@ -170,23 +170,34 @@ class Trainer(TrainerBase):
 
         self.log_grad_norms = cf.train_logging.get("log_grad_norms", False)
 
-        # create output directory
+        # Every rank writes its own diagnostic timeline when enabled.
+        config.get_path_run(cf).mkdir(exist_ok=True, parents=True)
         if is_root():
-            config.get_path_run(cf).mkdir(exist_ok=True, parents=True)
             config.get_path_model(cf).mkdir(exist_ok=True, parents=True)
 
         self.train_logger = TrainLogger(cf, config.get_path_run(self.cf))
 
         timeline_cfg = cf.train_logging.get("cgroup_memory_timeline", {})
-        if timeline_cfg.get("enabled", False) and is_root():
+        if timeline_cfg.get("enabled", False):
             self.cgroup_memory_timeline = CgroupMemoryTimeline(
-                log_fn=lambda metrics: self.train_logger.log_metrics(SYSTEM, metrics),
+                log_fn=lambda metrics: self.train_logger.log_diagnostic_metrics(
+                    SYSTEM, metrics, rank=cf.rank
+                ),
                 sampling_interval_ms=timeline_cfg.get("sampling_interval_ms", 100),
+                sample_cgroup=is_root(),
+                process_sampling_interval_ms=timeline_cfg.get("process_sampling_interval_ms", 1000),
+                rank=cf.rank,
             )
+            if is_root():
+                logger.info(
+                    "Cgroup memory timeline will sample %s every %d ms",
+                    self.cgroup_memory_timeline.cgroup_path,
+                    timeline_cfg.get("sampling_interval_ms", 100),
+                )
             logger.info(
-                "Cgroup memory timeline will sample %s every %d ms",
-                self.cgroup_memory_timeline.cgroup_path,
-                timeline_cfg.get("sampling_interval_ms", 100),
+                "Process memory timeline will sample rank %d every %d ms",
+                cf.rank,
+                timeline_cfg.get("process_sampling_interval_ms", 1000),
             )
 
         # Initialize collapse monitor for SSL training

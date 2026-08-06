@@ -131,11 +131,12 @@ train_logging:
   checkpoint: 250
   log_grad_norms: False
 
-  # Diagnostic-only host-memory timeline. The root rank samples the resolved
-  # job/current cgroup-v2 counters and writes them to the training metrics file.
+  # Diagnostic-only host-memory timeline. Rank 0 samples job cgroup-v2 counters;
+  # every rank samples its trainer and DataLoader workers into rank-sharded files.
   cgroup_memory_timeline:
     enabled: False
     sampling_interval_ms: 100
+    process_sampling_interval_ms: 1000
 
 # parameters for data loading
 data_loading :

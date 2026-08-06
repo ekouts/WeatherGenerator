@@ -12,6 +12,7 @@ from pathlib import Path
 from weathergen.utils.cgroup_memory import (
     CgroupMemoryTimeline,
     read_cgroup_memory_snapshot,
+    read_process_memory_snapshot,
     resolve_cgroup_v2_path,
 )
 
@@ -22,6 +23,39 @@ def _write_cgroup_files(path: Path) -> None:
     (path / "memory.peak").write_text("2400\n")
     (path / "memory.stat").write_text("anon 700\nfile 400\nshmem 100\n")
     (path / "memory.events").write_text("low 0\nhigh 1\nmax 2\noom 3\noom_kill 4\n")
+
+
+def _write_smaps_rollup(proc_root: Path, pid: int, offset_kib: int = 0) -> None:
+    process_path = proc_root / str(pid)
+    process_path.mkdir(parents=True)
+    (process_path / "smaps_rollup").write_text(
+        "1000-2000 ---p 00000000 00:00 0 [rollup]\n"
+        f"Rss: {10 + offset_kib} kB\n"
+        f"Pss: {9 + offset_kib} kB\n"
+        f"Pss_Anon: {6 + offset_kib} kB\n"
+        "Pss_File: 2 kB\n"
+        "Pss_Shmem: 1 kB\n"
+        f"Private_Dirty: {5 + offset_kib} kB\n"
+    )
+
+
+class _FakeProcess:
+    def __init__(
+        self,
+        pid: int,
+        create_time: float,
+        children: list["_FakeProcess"] | None = None,
+    ) -> None:
+        self.pid = pid
+        self._create_time = create_time
+        self._children = children or []
+
+    def create_time(self) -> float:
+        return self._create_time
+
+    def children(self, recursive: bool) -> list["_FakeProcess"]:
+        assert recursive
+        return self._children
 
 
 def test_resolve_slurm_job_cgroup(tmp_path: Path) -> None:
@@ -52,6 +86,19 @@ def test_read_cgroup_memory_snapshot(tmp_path: Path) -> None:
     }
 
 
+def test_read_process_memory_snapshot(tmp_path: Path) -> None:
+    _write_smaps_rollup(tmp_path, 10)
+
+    assert read_process_memory_snapshot(10, tmp_path) == {
+        "diagnostic.process_memory.pss_bytes": 9 * 1024.0,
+        "diagnostic.process_memory.pss_anon_bytes": 6 * 1024.0,
+        "diagnostic.process_memory.pss_file_bytes": 2 * 1024.0,
+        "diagnostic.process_memory.pss_shmem_bytes": 1024.0,
+        "diagnostic.process_memory.rss_bytes": 10 * 1024.0,
+        "diagnostic.process_memory.private_dirty_bytes": 5 * 1024.0,
+    }
+
+
 def test_timeline_records_samples_and_markers(tmp_path: Path) -> None:
     _write_cgroup_files(tmp_path)
     records: list[dict[str, float]] = []
@@ -68,4 +115,59 @@ def test_timeline_records_samples_and_markers(tmp_path: Path) -> None:
         if record.get("diagnostic.timeline.stage.batch_dequeued") == 1.0
     )
     assert marker["diagnostic.timeline.monotonic_ns"] == 123.0
+    assert marker["diagnostic.timeline.rank"] == 0.0
     assert marker["diagnostic.timeline.batch_index"] == 2.0
+
+
+def test_timeline_samples_trainer_and_worker_per_rank(tmp_path: Path) -> None:
+    trainer = _FakeProcess(10, 1.0, [_FakeProcess(11, 2.0)])
+    _write_smaps_rollup(tmp_path, 10)
+    _write_smaps_rollup(tmp_path, 11, offset_kib=10)
+    records: list[dict[str, float]] = []
+    timeline = CgroupMemoryTimeline(
+        records.append,
+        sampling_interval_ms=100,
+        sample_cgroup=False,
+        process_sampling_interval_ms=10,
+        rank=2,
+        proc_root=tmp_path,
+        trainer_process=trainer,
+    )
+
+    timeline.start()
+    timeline.stop()
+
+    process_records = [
+        record for record in records if record.get("diagnostic.process_memory.sample") == 1.0
+    ]
+    assert len(process_records) == 2
+    trainer_record = next(
+        record
+        for record in process_records
+        if record.get("diagnostic.process_memory.role.trainer") == 1.0
+    )
+    worker_record = next(
+        record
+        for record in process_records
+        if record.get("diagnostic.process_memory.role.worker") == 1.0
+    )
+    assert trainer_record["diagnostic.timeline.rank"] == 2.0
+    assert trainer_record["diagnostic.process_memory.worker_slot"] == -1.0
+    assert worker_record["diagnostic.process_memory.pid"] == 11.0
+    assert worker_record["diagnostic.process_memory.worker_slot"] == 0.0
+    assert worker_record["diagnostic.process_memory.worker_generation"] == 0.0
+
+
+def test_worker_slot_generation_increments_after_respawn(tmp_path: Path) -> None:
+    _write_smaps_rollup(tmp_path, 10)
+    timeline = CgroupMemoryTimeline(
+        lambda _record: None,
+        sample_cgroup=False,
+        process_sampling_interval_ms=1000,
+        proc_root=tmp_path,
+        trainer_process=_FakeProcess(10, 1.0),
+    )
+
+    assert timeline._update_worker_metadata({(11, 2.0)})[(11, 2.0)] == (0, 0)
+    timeline._update_worker_metadata(set())
+    assert timeline._update_worker_metadata({(12, 3.0)})[(12, 3.0)] == (0, 1)

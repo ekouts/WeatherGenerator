@@ -26,7 +26,11 @@ import weathergen.common.config as config
 # from weathergen.train.trainer import cfg_keys_to_filter
 from weathergen.train.utils import Stage, flatten_dict
 from weathergen.utils.distributed import ddp_average
-from weathergen.utils.metrics import get_train_metrics_path, read_metrics_file
+from weathergen.utils.metrics import (
+    get_diagnostic_metrics_path,
+    get_train_metrics_path,
+    read_metrics_file,
+)
 
 _weathergen_timestamp = "weathergen.timestamp"
 _weathergen_reltime = "weathergen.reltime"
@@ -69,7 +73,34 @@ class TrainLogger:
         Log metrics to a file.
         For now, just scalar values are expected. There is no check.
         """
-        ## Clean all the metrics to convert to float.
+        metrics_path = get_train_metrics_path(
+            base_path=config.get_path_run(self.cf), run_id=self.cf.general.run_id
+        )
+        self._write_metrics(metrics_path, stage, metrics, step)
+
+    def log_diagnostic_metrics(
+        self,
+        stage: Stage,
+        metrics: dict[str, float],
+        rank: int,
+        step: int | None = None,
+    ) -> None:
+        """Log diagnostics to a rank-sharded file safe for one writer process."""
+        metrics_path = get_diagnostic_metrics_path(
+            base_path=config.get_path_run(self.cf),
+            run_id=self.cf.general.run_id,
+            rank=rank,
+        )
+        self._write_metrics(metrics_path, stage, metrics, step)
+
+    def _write_metrics(
+        self,
+        metrics_path: Path,
+        stage: Stage,
+        metrics: dict[str, float],
+        step: int | None,
+    ) -> None:
+        # Clean all the metrics to convert to float.
         #  Any other type (numpy etc.) will trigger a serialization error.
         clean_metrics = {
             _weathergen_timestamp: time.time_ns() // 1_000_000,
@@ -87,9 +118,6 @@ class TrainLogger:
         # TODO: performance: we repeatedly open the file for each call. Better for multiprocessing
         # but we can probably do better and rely for example on the logging module.
 
-        metrics_path = get_train_metrics_path(
-            base_path=config.get_path_run(self.cf), run_id=self.cf.general.run_id
-        )
         with self._write_lock, open(metrics_path, "ab") as f:
             s = json.dumps(clean_metrics) + "\n"
             f.write(s.encode("utf-8"))
