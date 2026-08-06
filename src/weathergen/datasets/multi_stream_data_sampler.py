@@ -26,6 +26,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
 )
 from weathergen.datasets.data_reader_obs import DataReaderObs
+from weathergen.datasets.healpix_domain import HealpixDomain
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -120,6 +121,13 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.local_num_healpix_cells = self.num_healpix_cells // spatial_parallel_size
         self.local_cell_start = self.spatial_parallel_rank * self.local_num_healpix_cells
         self.local_cell_end = self.local_cell_start + self.local_num_healpix_cells
+        # Reader-boundary early filtering: fixed-grid readers drop non-local rows
+        # right after decode instead of during tokenization. Off by default; only
+        # meaningful with more than one spatial rank.
+        self.reader_spatial_filtering = (
+            bool(cf.data_loading.get("reader_spatial_filtering", False))
+            and spatial_parallel_size > 1
+        )
         self.masker = Masker(cf.healpix_level, stage, cf.streams, self.mode_cfg)
         self.tokenizer = TokenizerMasking(
             cf.healpix_level,
@@ -267,6 +275,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         msg = f"Unsupported stream type {stream_info['type']}"
                         f"for stream name '{stream_name}'."
                         raise ValueError(msg)
+
+            # Only the fixed-grid anemoi reader supports early filtering; other
+            # readers return global data and rely on the tokenizer's late filtering.
+            if dataset is DataReaderAnemoi and self.reader_spatial_filtering:
+                kwargs["healpix_domain"] = HealpixDomain(
+                    self.healpix_level, self.local_cell_start, self.local_cell_end
+                )
 
             for fname in stream_info.get("filenames", [pathlib.Path()]):
                 fname = pathlib.Path(fname)

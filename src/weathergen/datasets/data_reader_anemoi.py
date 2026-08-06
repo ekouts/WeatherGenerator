@@ -26,6 +26,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     check_reader_data,
 )
+from weathergen.datasets.healpix_domain import HealpixDomain
 from weathergen.train.utils import Stage
 from weathergen.utils.distributed import is_root
 
@@ -41,6 +42,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         filename: Path,
         stream_info: dict,
         stage: Stage,
+        healpix_domain: HealpixDomain | None = None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -51,11 +53,18 @@ class DataReaderAnemoi(DataReaderTimestep):
             filename (and path) of dataset
         stream_info :
             information about stream
+        healpix_domain :
+            when set, source reads return only grid rows in this rank's HEALPix
+            cell range; targets remain global
 
         Returns
         -------
         None
         """
+
+        self.healpix_domain = healpix_domain
+        # Global grid-row indices owned by this rank; None means no filtering.
+        self.local_grid_rows: NDArray[np.int64] | None = None
 
         # use anemoi_config if it's defined; ignore filename in this case
         data_paths = stream_info.get("data_paths", [])
@@ -120,6 +129,12 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.latitudes = _clip_lat(ds.latitudes)
         self.longitudes = _clip_lon(ds.longitudes)
 
+        # Anemoi fixed grids expose one lat/lon per grid row for the whole dataset,
+        # so the rank-local row selection is computed once here and reused for
+        # every window in _get.
+        if healpix_domain is not None:
+            self.local_grid_rows = healpix_domain.grid_point_rows(self.latitudes, self.longitudes)
+
         # select/filter requested source channels
         if stream_info.get(str(stage) + "_source_channels") is None:
             self.source_idx = self.select_channels(ds, "source")
@@ -174,13 +189,30 @@ class DataReaderAnemoi(DataReaderTimestep):
         super().init_empty()
         self.ds = None
         self.len = 0
+        self.local_grid_rows = None
 
     @override
     def length(self) -> int:
         return self.len
 
     @override
-    def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
+    def get_source(self, idx: TIndex) -> ReaderData:
+        """
+        Get source data for idx, restricted to the local HEALPix domain when set.
+
+        Targets deliberately stay global (get_target is unchanged): target values
+        feed the still-global loss, while non-local source rows would be dropped
+        by the tokenizer anyway.
+        """
+        return self._get(idx, self.source_idx, grid_rows=self.local_grid_rows)
+
+    @override
+    def _get(
+        self,
+        idx: TIndex,
+        channels_idx: list[int],
+        grid_rows: NDArray[np.int64] | None = None,
+    ) -> ReaderData:
         """
         Get data for window (for either source or target, through public interface)
 
@@ -190,6 +222,8 @@ class DataReaderAnemoi(DataReaderTimestep):
             Index of temporal window
         channels_idx : np.array
             Selection of channels
+        grid_rows : np.array, optional
+            When given, only these grid rows (per timestep) are returned
 
         Returns
         -------
@@ -213,12 +247,18 @@ class DataReaderAnemoi(DataReaderTimestep):
         # subsetting is pushed to the ctor via frequency argument; this also ensures that no sub-
         # sampling is required here
         try:
-            data = self.ds[didx_start:didx_end][:, :, 0].astype(np.float32)
+            data = self.ds[didx_start:didx_end][:, :, 0]
         except MissingDateError as e:
             _logger.debug(f"Date not present in anemoi dataset: {str(e)}. Skipping.")
             return ReaderData.empty(
                 num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
             )
+
+        # Filter to the rank-local grid rows immediately after the decode, before
+        # any full-size copies are made. The fetched chunk itself is still global.
+        if grid_rows is not None:
+            data = data[:, :, grid_rows]
+        data = data.astype(np.float32)
 
         # coords-first representation and collapse multiple steps
         data = data.transpose([0, 2, 1]).reshape((data.shape[0] * data.shape[2], -1))
@@ -229,10 +269,12 @@ class DataReaderAnemoi(DataReaderTimestep):
         data = data[:, list(channels_idx)]
 
         # construct lat/lon coords
+        lats = self.latitudes if grid_rows is None else self.latitudes[grid_rows]
+        lons = self.longitudes if grid_rows is None else self.longitudes[grid_rows]
         latlon = np.concatenate(
             [
-                np.expand_dims(self.latitudes, 0),
-                np.expand_dims(self.longitudes, 0),
+                np.expand_dims(lats, 0),
+                np.expand_dims(lons, 0),
             ],
             axis=0,
         ).transpose()

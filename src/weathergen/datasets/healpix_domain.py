@@ -7,7 +7,51 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from dataclasses import dataclass
+
 import numpy as np
+from astropy_healpix.healpy import ang2pix
+from numpy.typing import NDArray
+
+
+def theta_phi_to_standard_coords(coords):
+    thetas = ((90.0 - coords[:, 0]) / 180.0) * np.pi
+    phis = ((coords[:, 1] + 180.0) / 360.0) * 2.0 * np.pi
+
+    return thetas, phis
+
+
+@dataclass(frozen=True)
+class HealpixDomain:
+    """One rank's consecutive nested HEALPix cell range [cell_start, cell_end)."""
+
+    level: int
+    cell_start: int
+    cell_end: int
+
+    def __post_init__(self) -> None:
+        num_cells = 12 * 4**self.level
+        if not 0 <= self.cell_start < self.cell_end <= num_cells:
+            raise ValueError(
+                f"invalid HEALPix cell range [{self.cell_start}, {self.cell_end}) "
+                f"for {num_cells} cells"
+            )
+
+    def grid_point_rows(
+        self,
+        latitudes: NDArray[np.float32],
+        longitudes: NDArray[np.float32],
+    ) -> NDArray[np.int64]:
+        """Rows of a fixed grid whose points fall in the local cell range.
+
+        Cells must be assigned exactly as in the tokenizer (`hpy_cell_splits`) so
+        that filtering at the reader boundary keeps precisely the rows that late
+        filtering during tokenization would keep.
+        """
+        coords = np.stack([latitudes, longitudes], axis=1)
+        thetas, phis = theta_phi_to_standard_coords(coords)
+        cell_ids = ang2pix(2**self.level, thetas, phis, nest=True)
+        return np.flatnonzero((cell_ids >= self.cell_start) & (cell_ids < self.cell_end))
 
 
 def build_local_healpix_cell_splits(
