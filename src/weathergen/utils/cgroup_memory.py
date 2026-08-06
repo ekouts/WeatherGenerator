@@ -154,10 +154,18 @@ class CgroupMemoryTimeline:
         self._thread.join(timeout=max(1.0, 2 * self._sampling_interval_s))
         self._thread = None
 
-    def record_stage(self, name: str, **values: int | float) -> None:
+    def record_stage(
+        self,
+        name: str,
+        *,
+        monotonic_ns: int | None = None,
+        **values: int | float,
+    ) -> None:
         """Queue a timestamped marker without performing file I/O in the training path."""
         marker = {
-            "diagnostic.timeline.monotonic_ns": float(time.monotonic_ns()),
+            "diagnostic.timeline.monotonic_ns": float(
+                time.monotonic_ns() if monotonic_ns is None else monotonic_ns
+            ),
             f"diagnostic.timeline.stage.{name}": 1.0,
         }
         marker.update({f"diagnostic.timeline.{key}": float(value) for key, value in values.items()})

@@ -498,30 +498,65 @@ class Trainer(TrainerBase):
             except StopIteration:
                 break
             if self.cgroup_memory_timeline is not None:
+                batch_dequeued_ns = time.monotonic_ns()
+                batch_timeline_values = {
+                    "temporal_index": batch.temporal_index,
+                    "batch_unique_tensor_storage_bytes": batch.unique_tensor_storage_bytes(),
+                }
                 self.cgroup_memory_timeline.record_stage(
-                    "batch_dequeued", mini_epoch=mini_epoch, batch_index=bidx
+                    "batch_dequeued",
+                    monotonic_ns=batch_dequeued_ns,
+                    mini_epoch=mini_epoch,
+                    batch_index=bidx,
+                    **batch_timeline_values,
                 )
             with self.training_loop_annotation_context(f"batch_{bidx}"):
                 if cf.data_loading.get("memory_pinning", False):
                     # pin memory for faster CPU-GPU transfer
                     if self.cgroup_memory_timeline is not None:
                         self.cgroup_memory_timeline.record_stage(
-                            "pin_start", mini_epoch=mini_epoch, batch_index=bidx
+                            "pin_start",
+                            mini_epoch=mini_epoch,
+                            batch_index=bidx,
+                            **batch_timeline_values,
                         )
                     batch = batch.pin_memory()
                     if self.cgroup_memory_timeline is not None:
+                        pin_end_ns = time.monotonic_ns()
+                        batch_timeline_values = {
+                            "temporal_index": batch.temporal_index,
+                            "batch_unique_tensor_storage_bytes": (
+                                batch.unique_tensor_storage_bytes()
+                            ),
+                        }
                         self.cgroup_memory_timeline.record_stage(
-                            "pin_end", mini_epoch=mini_epoch, batch_index=bidx
+                            "pin_end",
+                            monotonic_ns=pin_end_ns,
+                            mini_epoch=mini_epoch,
+                            batch_index=bidx,
+                            **batch_timeline_values,
                         )
 
                 if self.cgroup_memory_timeline is not None:
                     self.cgroup_memory_timeline.record_stage(
-                        "h2d_start", mini_epoch=mini_epoch, batch_index=bidx
+                        "h2d_start",
+                        mini_epoch=mini_epoch,
+                        batch_index=bidx,
+                        **batch_timeline_values,
                     )
                 batch.to_device(self.device)
                 if self.cgroup_memory_timeline is not None:
+                    h2d_enqueued_ns = time.monotonic_ns()
+                    batch_timeline_values = {
+                        "temporal_index": batch.temporal_index,
+                        "batch_unique_tensor_storage_bytes": batch.unique_tensor_storage_bytes(),
+                    }
                     self.cgroup_memory_timeline.record_stage(
-                        "h2d_enqueued", mini_epoch=mini_epoch, batch_index=bidx
+                        "h2d_enqueued",
+                        monotonic_ns=h2d_enqueued_ns,
+                        mini_epoch=mini_epoch,
+                        batch_index=bidx,
+                        **batch_timeline_values,
                     )
 
                 with torch.autocast(
@@ -531,7 +566,10 @@ class Trainer(TrainerBase):
                 ):
                     if self.cgroup_memory_timeline is not None:
                         self.cgroup_memory_timeline.record_stage(
-                            "forward_start", mini_epoch=mini_epoch, batch_index=bidx
+                            "forward_start",
+                            mini_epoch=mini_epoch,
+                            batch_index=bidx,
+                            **batch_timeline_values,
                         )
                     preds = self.model(
                         model_params=self.model_params,
@@ -539,7 +577,10 @@ class Trainer(TrainerBase):
                     )
                     if self.cgroup_memory_timeline is not None:
                         self.cgroup_memory_timeline.record_stage(
-                            "forward_end", mini_epoch=mini_epoch, batch_index=bidx
+                            "forward_end",
+                            mini_epoch=mini_epoch,
+                            batch_index=bidx,
+                            **batch_timeline_values,
                         )
 
                     targets_and_auxs = {}
@@ -580,7 +621,10 @@ class Trainer(TrainerBase):
                 self.grad_scaler.scale(loss).backward()
                 if self.cgroup_memory_timeline is not None:
                     self.cgroup_memory_timeline.record_stage(
-                        "backward_end", mini_epoch=mini_epoch, batch_index=bidx
+                        "backward_end",
+                        mini_epoch=mini_epoch,
+                        batch_index=bidx,
+                        **batch_timeline_values,
                     )
 
                 # gradient clipping
@@ -601,7 +645,10 @@ class Trainer(TrainerBase):
                 self.grad_scaler.update()
                 if self.cgroup_memory_timeline is not None:
                     self.cgroup_memory_timeline.record_stage(
-                        "optimizer_end", mini_epoch=mini_epoch, batch_index=bidx
+                        "optimizer_end",
+                        mini_epoch=mini_epoch,
+                        batch_index=bidx,
+                        **batch_timeline_values,
                     )
 
                 # update learning rate

@@ -58,7 +58,7 @@ def test_timeline_records_samples_and_markers(tmp_path: Path) -> None:
     timeline = CgroupMemoryTimeline(records.append, sampling_interval_ms=10, cgroup_path=tmp_path)
 
     timeline.start()
-    timeline.record_stage("batch_dequeued", batch_index=2)
+    timeline.record_stage("batch_dequeued", monotonic_ns=123, batch_index=2)
     timeline.stop()
 
     assert any(record.get("diagnostic.timeline.sample") == 1.0 for record in records)
@@ -67,4 +67,5 @@ def test_timeline_records_samples_and_markers(tmp_path: Path) -> None:
         for record in records
         if record.get("diagnostic.timeline.stage.batch_dequeued") == 1.0
     )
+    assert marker["diagnostic.timeline.monotonic_ns"] == 123.0
     assert marker["diagnostic.timeline.batch_index"] == 2.0

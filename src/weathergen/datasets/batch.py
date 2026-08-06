@@ -298,6 +298,9 @@ class ModelBatch:
     # device of the tensors in the batch
     device: str | torch.device
 
+    # temporal index selected by the sampler
+    temporal_index: int
+
     def __init__(
         self,
         stream_names: list[str],
@@ -305,6 +308,7 @@ class ModelBatch:
         num_target_samples: int,
         output_offset,
         output_steps,
+        temporal_index: int,
     ) -> None:
         """ """
 
@@ -312,6 +316,7 @@ class ModelBatch:
         self.output_offset = output_offset
         self.output_steps = output_steps
         self.output_idxs = list(range(output_offset, output_steps))
+        self.temporal_index = int(temporal_index)
 
         self.source_samples = BatchSamples(
             stream_names, num_source_samples, output_steps, self.output_idxs
@@ -322,6 +327,39 @@ class ModelBatch:
 
         self.source2target_matching_idxs = np.full(num_source_samples, -1, dtype=np.int32)
         self.target2source_matching_idxs = [[] for _ in range(num_target_samples)]
+
+    def unique_tensor_storage_bytes(self) -> int:
+        """Return bytes owned by unique tensor storages referenced by this batch."""
+        storages: dict[tuple[str, int | None, int, int], int] = {}
+
+        def add_tensors(value) -> None:
+            if isinstance(value, torch.Tensor):
+                storage = value.untyped_storage()
+                storage_bytes = storage.nbytes()
+                key = (
+                    value.device.type,
+                    value.device.index,
+                    storage.data_ptr(),
+                    storage_bytes,
+                )
+                storages[key] = storage_bytes
+            elif isinstance(value, dict):
+                for item in value.values():
+                    add_tensors(item)
+            elif isinstance(value, list | tuple):
+                for item in value:
+                    add_tensors(item)
+
+        for batch_samples in (self.source_samples, self.target_samples):
+            add_tensors(batch_samples.tokens_lens)
+            for sample in batch_samples.samples:
+                for metadata in sample.meta_info.values():
+                    add_tensors(metadata.mask)
+                for stream_data in sample.streams_data.values():
+                    if stream_data is not None:
+                        add_tensors(vars(stream_data))
+
+        return sum(storages.values())
 
     def pin_memory(self):
         """Pin all tensors in this batch to CPU pinned memory"""
