@@ -134,6 +134,12 @@ class DataReaderAnemoi(DataReaderTimestep):
         # every window in _get.
         if healpix_domain is not None:
             self.local_grid_rows = healpix_domain.grid_point_rows(self.latitudes, self.longitudes)
+            ds_name = stream_info["name"]
+            _logger.info(
+                f"{ds_name}: reader spatial filtering active, rank owns "
+                f"{len(self.local_grid_rows)}/{len(self.latitudes)} grid rows "
+                f"(cells [{healpix_domain.cell_start}, {healpix_domain.cell_end}))"
+            )
 
         # select/filter requested source channels
         if stream_info.get(str(stage) + "_source_channels") is None:
@@ -247,17 +253,21 @@ class DataReaderAnemoi(DataReaderTimestep):
         # subsetting is pushed to the ctor via frequency argument; this also ensures that no sub-
         # sampling is required here
         try:
-            data = self.ds[didx_start:didx_end][:, :, 0]
+            if grid_rows is None:
+                data = self.ds[didx_start:didx_end][:, :, 0]
+            else:
+                # Decode one timestep at a time and filter to the rank-local grid
+                # rows immediately, so the transient decode buffer holds a single
+                # global timestep instead of the whole window.
+                data = np.stack(
+                    [self.ds[i][:, 0][:, grid_rows] for i in range(didx_start, didx_end)]
+                )
         except MissingDateError as e:
             _logger.debug(f"Date not present in anemoi dataset: {str(e)}. Skipping.")
             return ReaderData.empty(
                 num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
             )
 
-        # Filter to the rank-local grid rows immediately after the decode, before
-        # any full-size copies are made. The fetched chunk itself is still global.
-        if grid_rows is not None:
-            data = data[:, :, grid_rows]
         data = data.astype(np.float32)
 
         # coords-first representation and collapse multiple steps
