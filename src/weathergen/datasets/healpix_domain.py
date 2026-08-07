@@ -47,10 +47,16 @@ class HealpixDomain:
         Cells must be assigned exactly as in the tokenizer (`hpy_cell_splits`) so
         that filtering at the reader boundary keeps precisely the rows that late
         filtering during tokenization would keep.
+
+        Rows with non-finite coordinates (e.g. off-disk geostationary pixels)
+        belong to no rank: the unfiltered path drops them in the later NaN
+        cleanup, so the union of all ranks still matches the cleaned full read.
         """
-        coords = np.stack([latitudes, longitudes], axis=1)
+        valid = np.isfinite(latitudes) & np.isfinite(longitudes)
+        coords = np.stack([latitudes[valid], longitudes[valid]], axis=1)
         thetas, phis = theta_phi_to_standard_coords(coords)
-        cell_ids = ang2pix(2**self.level, thetas, phis, nest=True)
+        cell_ids = np.full(latitudes.shape, -1, dtype=np.int64)
+        cell_ids[valid] = ang2pix(2**self.level, thetas, phis, nest=True)
         return np.flatnonzero((cell_ids >= self.cell_start) & (cell_ids < self.cell_end))
 
 

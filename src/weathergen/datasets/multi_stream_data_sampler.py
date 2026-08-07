@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import dataclasses
+import inspect
 import logging
 import pathlib
 from collections.abc import Sequence
@@ -276,9 +277,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         f"for stream name '{stream_name}'."
                         raise ValueError(msg)
 
-            # Only the fixed-grid anemoi reader supports early filtering; other
-            # readers return global data and rely on the tokenizer's late filtering.
-            if dataset is DataReaderAnemoi and self.reader_spatial_filtering:
+            # Fixed-grid readers that take a healpix_domain support early
+            # filtering (DataReaderAnemoi and subclasses like anemoi_operan);
+            # other readers return global data and rely on the tokenizer's late
+            # filtering.
+            if self.reader_spatial_filtering and (
+                "healpix_domain" in inspect.signature(dataset.__init__).parameters
+            ):
                 kwargs["healpix_domain"] = HealpixDomain(
                     self.healpix_level, self.local_cell_start, self.local_cell_end
                 )

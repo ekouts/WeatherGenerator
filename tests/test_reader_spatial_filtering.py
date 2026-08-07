@@ -79,6 +79,18 @@ def test_grid_point_rows_disjoint_partition():
     np.testing.assert_array_equal(union, np.arange(len(coords)))
 
 
+def test_grid_point_rows_excludes_nan_coordinates():
+    """Off-disk pixels (NaN coords) belong to no rank; finite rows still partition."""
+    coords = _random_coords(5_000, seed=23)
+    coords[::7, 0] = np.nan
+    coords[::11, 1] = np.nan
+    finite = np.flatnonzero(np.isfinite(coords).all(axis=1))
+
+    all_rows = [d.grid_point_rows(coords[:, 0], coords[:, 1]) for d in _domains(SPATIAL_SIZE)]
+    union = np.sort(np.concatenate(all_rows))
+    np.testing.assert_array_equal(union, finite)
+
+
 def test_healpix_domain_rejects_invalid_range():
     with pytest.raises(ValueError, match="invalid HEALPix cell range"):
         HealpixDomain(HEALPIX_LEVEL, 0, NUM_CELLS + 1)
@@ -181,6 +193,47 @@ def test_targets_stay_global(o96_readers):
         rdata_target = reader.get_target(idx)
         np.testing.assert_array_equal(rdata_target.data, rdata_full.data)
         np.testing.assert_array_equal(rdata_target.coords, rdata_full.coords)
+
+
+@needs_o96
+def test_operan_reader_filters_sources(o96_readers):
+    """DataReaderAnemoiOperan inherits early filtering through _read_window."""
+    from weathergen.readers_extra.data_reader_anemoi_operan import DataReaderAnemoiOperan
+
+    full = o96_readers[0]
+    # identity mapping: every nominal hour is its own availability hour
+    stream_info = OmegaConf.create(
+        {
+            "name": "operan_test",
+            "type": "anemoi_operan",
+            "nominal_time_mapping": {str(h): h for h in range(24)},
+        }
+    )
+
+    def make(domain):
+        return DataReaderAnemoiOperan(
+            tw_handler=full.time_window_handler,
+            filename=O96_ZARR,
+            stream_info=stream_info,
+            stage="train",
+            healpix_domain=domain,
+        )
+
+    idx = np.int64(2)  # >= 1: operan prepends one earlier timestep
+    rdata_full = make(None).get_source(idx)
+    num_points = len(full.latitudes)
+    num_steps = len(rdata_full.data) // num_points
+    assert num_steps >= 1
+
+    for domain in _domains(SPATIAL_SIZE):
+        reader = make(domain)
+        rdata_local = reader.get_source(idx)
+        rows = reader.local_grid_rows
+        global_rows = np.concatenate([t * num_points + rows for t in range(num_steps)])
+        np.testing.assert_array_equal(rdata_local.data, rdata_full.data[global_rows])
+        np.testing.assert_array_equal(rdata_local.coords, rdata_full.coords[global_rows])
+        # targets stay global for operan too
+        np.testing.assert_array_equal(reader.get_target(idx).data, make(None).get_target(idx).data)
 
 
 @needs_o96

@@ -249,9 +249,30 @@ class DataReaderAnemoi(DataReaderTimestep):
             )
 
         assert t_idxs[0] >= 0, "index must be non-negative"
-        didx_start = t_idxs[0]
         # End is inclusive
-        didx_end = t_idxs[-1] + 1
+        rd = self._read_window(t_idxs[0], t_idxs[-1] + 1, channels_idx, grid_rows)
+        if rd is None:
+            return ReaderData.empty(
+                num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
+            )
+        check_reader_data(rd, dtr)
+
+        return rd
+
+    def _read_window(
+        self,
+        didx_start: int,
+        didx_end: int,
+        channels_idx: list[int],
+        grid_rows: NDArray[np.int64] | None = None,
+    ) -> ReaderData | None:
+        """
+        Decode dataset timesteps [didx_start, didx_end) and assemble ReaderData.
+
+        Returns None when a date is missing from the dataset. Shared by
+        DataReaderAnemoi and subclasses with their own window selection
+        (e.g. DataReaderAnemoiOperan).
+        """
 
         # extract number of time steps and collapse ensemble dimension
         # ds is a wrapper around zarr with get_coordinate_selection not being exposed since
@@ -269,11 +290,10 @@ class DataReaderAnemoi(DataReaderTimestep):
                 )
         except MissingDateError as e:
             _logger.debug(f"Date not present in anemoi dataset: {str(e)}. Skipping.")
-            return ReaderData.empty(
-                num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
-            )
+            return None
 
         data = data.astype(np.float32)
+        num_steps = didx_end - didx_start
 
         # coords-first representation and collapse multiple steps
         data = data.transpose([0, 2, 1]).reshape((data.shape[0] * data.shape[2], -1))
@@ -293,22 +313,19 @@ class DataReaderAnemoi(DataReaderTimestep):
             ],
             axis=0,
         ).transpose()
-        # repeat latlon len(t_idxs) times
-        coords = np.vstack((latlon,) * len(t_idxs))
+        # repeat latlon num_steps times
+        coords = np.vstack((latlon,) * num_steps)
 
         # date time matching #data points of data
         # Assuming a fixed frequency for the dataset
-        datetimes = np.repeat(self.ds.dates[didx_start:didx_end], len(data) // len(t_idxs))
+        datetimes = np.repeat(self.ds.dates[didx_start:didx_end], len(data) // num_steps)
 
-        rd = ReaderData(
+        return ReaderData(
             coords=coords,
             geoinfos=geoinfos,
             data=data,
             datetimes=datetimes,
         )
-        check_reader_data(rd, dtr)
-
-        return rd
 
     def select_channels(self, ds0: anemoi_datasets, ch_type: str) -> NDArray[np.int64]:
         """
