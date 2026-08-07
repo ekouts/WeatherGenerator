@@ -148,6 +148,31 @@ def test_early_filtered_sources_reassemble_to_full_read(o96_readers, window_idx)
 
 
 @needs_o96
+def test_legacy_get_signature_subclass_still_works(o96_readers):
+    """Subclasses overriding _get without grid_rows (e.g. anemoi_operan) must not break.
+
+    They never receive a healpix_domain, so get_source must call _get with the
+    legacy two-argument form for them.
+    """
+    from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
+
+    full, _ = o96_readers
+
+    class LegacyReader(DataReaderAnemoi):
+        def _get(self, idx, channels_idx):
+            return super()._get(idx, channels_idx)
+
+    legacy = LegacyReader(
+        tw_handler=full.time_window_handler,
+        filename=O96_ZARR,
+        stream_info=full.stream_info,
+        stage="train",
+    )
+    rdata = legacy.get_source(np.int64(0))
+    np.testing.assert_array_equal(rdata.data, full.get_source(np.int64(0)).data)
+
+
+@needs_o96
 def test_targets_stay_global(o96_readers):
     full, local = o96_readers
     idx = np.int64(0)
