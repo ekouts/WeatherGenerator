@@ -125,8 +125,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.tokenizer = TokenizerMasking(
             cf.healpix_level,
             self.masker,
-            self.local_cell_start,
-            self.local_cell_end,
+            self.spatial_shard,
         )
         if spatial_parallel_size > 1:
             logger.info(

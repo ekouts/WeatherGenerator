@@ -41,9 +41,9 @@ from weathergen.model.engines import (
 )
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.spatial_parallel import (
+    ensure_packed_cell_shard,
     reassemble_packed_cell_shards,
     select_healpix_neighborhood_shard,
-    select_packed_cell_shard,
     split_cell_lens_by_shard,
 )
 from weathergen.model.utils import get_num_parameters
@@ -817,17 +817,17 @@ class Model(torch.nn.Module):
                 batch.samples[i_b].streams_data[stream_name].target_coords[step]
                 for i_b in range(batch_size)
             ]
-            t_coords_lens = [len(t) for t in t_coords]
             t_coords = torch.cat(t_coords)
-            if len(t_coords) == 0:
-                continue
             tcls_global = torch.stack(
                 [
                     sample.streams_data[stream_name].target_coords_lens[step]
                     for sample in batch.samples
                 ]
             )
-            t_coords, tcls = select_packed_cell_shard(
+            if tcls_global.sum() == 0:
+                continue
+            t_coords_lens = tcls_global.sum(dim=1).tolist()
+            t_coords, tcls = ensure_packed_cell_shard(
                 t_coords,
                 tcls_global.flatten(),
                 self.num_healpix_cells,
