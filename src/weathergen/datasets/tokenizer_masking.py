@@ -23,6 +23,7 @@ from weathergen.datasets.tokenizer_utils import (
     tokenize_space,
     tokenize_spacetime,
 )
+from weathergen.utils.spatial_shard import SpatialShard
 
 
 def readerdata_to_torch(rdata: IOReaderData) -> IOReaderData:
@@ -44,24 +45,20 @@ class TokenizerMasking(Tokenizer):
         self,
         healpix_level: int,
         masker: Masker,
-        source_cell_start: int = 0,
-        source_cell_end: int | None = None,
+        spatial_shard: SpatialShard | None = None,
     ):
         super().__init__(healpix_level)
         self.masker = masker
         self.rng = None
         self.token_size = None
-        self.source_cell_start = source_cell_start
-        self.source_cell_end = (
-            self.num_healpix_cells_source if source_cell_end is None else source_cell_end
-        )
-        if not (
-            0 <= self.source_cell_start < self.source_cell_end <= self.num_healpix_cells_source
-        ):
+        self.spatial_shard = spatial_shard or SpatialShard(healpix_level, 1, 0)
+        if self.spatial_shard.healpix_level != healpix_level:
             raise ValueError(
-                f"invalid source HEALPix cell range "
-                f"[{self.source_cell_start}, {self.source_cell_end})"
+                f"spatial shard HEALPix level ({self.spatial_shard.healpix_level}) does not "
+                f"match tokenizer level ({healpix_level})"
             )
+        self.source_cell_start = self.spatial_shard.cell_start
+        self.source_cell_end = self.spatial_shard.cell_end
 
     def reset_rng(self, rng) -> None:
         """
@@ -204,6 +201,8 @@ class TokenizerMasking(Tokenizer):
             self.hpy_verts_local_target,
             self.hpy_nctrs_target,
             encode_times_target,
+            cell_start=self.source_cell_start,
+            cell_end=self.source_cell_end,
         )
 
         return (coords_local, coords_per_cell)

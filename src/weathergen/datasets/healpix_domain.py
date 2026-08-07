@@ -7,11 +7,11 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-from dataclasses import dataclass
-
 import numpy as np
 from astropy_healpix.healpy import ang2pix
 from numpy.typing import NDArray
+
+from weathergen.utils.spatial_shard import SpatialShard
 
 
 def theta_phi_to_standard_coords(coords):
@@ -21,43 +21,27 @@ def theta_phi_to_standard_coords(coords):
     return thetas, phis
 
 
-@dataclass(frozen=True)
-class HealpixDomain:
-    """One rank's consecutive nested HEALPix cell range [cell_start, cell_end)."""
+def shard_grid_point_rows(
+    shard: SpatialShard,
+    latitudes: NDArray[np.float32],
+    longitudes: NDArray[np.float32],
+) -> NDArray[np.int64]:
+    """Rows of a fixed grid whose points fall in the shard's cell range.
 
-    level: int
-    cell_start: int
-    cell_end: int
+    Cells must be assigned exactly as in the tokenizer (`hpy_cell_splits`) so
+    that filtering at the reader boundary keeps precisely the rows that late
+    filtering during tokenization would keep.
 
-    def __post_init__(self) -> None:
-        num_cells = 12 * 4**self.level
-        if not 0 <= self.cell_start < self.cell_end <= num_cells:
-            raise ValueError(
-                f"invalid HEALPix cell range [{self.cell_start}, {self.cell_end}) "
-                f"for {num_cells} cells"
-            )
-
-    def grid_point_rows(
-        self,
-        latitudes: NDArray[np.float32],
-        longitudes: NDArray[np.float32],
-    ) -> NDArray[np.int64]:
-        """Rows of a fixed grid whose points fall in the local cell range.
-
-        Cells must be assigned exactly as in the tokenizer (`hpy_cell_splits`) so
-        that filtering at the reader boundary keeps precisely the rows that late
-        filtering during tokenization would keep.
-
-        Rows with non-finite coordinates (e.g. off-disk geostationary pixels)
-        belong to no rank: the unfiltered path drops them in the later NaN
-        cleanup, so the union of all ranks still matches the cleaned full read.
-        """
-        valid = np.isfinite(latitudes) & np.isfinite(longitudes)
-        coords = np.stack([latitudes[valid], longitudes[valid]], axis=1)
-        thetas, phis = theta_phi_to_standard_coords(coords)
-        cell_ids = np.full(latitudes.shape, -1, dtype=np.int64)
-        cell_ids[valid] = ang2pix(2**self.level, thetas, phis, nest=True)
-        return np.flatnonzero((cell_ids >= self.cell_start) & (cell_ids < self.cell_end))
+    Rows with non-finite coordinates (e.g. off-disk geostationary pixels)
+    belong to no rank: the unfiltered path drops them in the later NaN
+    cleanup, so the union of all ranks still matches the cleaned full read.
+    """
+    valid = np.isfinite(latitudes) & np.isfinite(longitudes)
+    coords = np.stack([latitudes[valid], longitudes[valid]], axis=1)
+    thetas, phis = theta_phi_to_standard_coords(coords)
+    cell_ids = np.full(latitudes.shape, -1, dtype=np.int64)
+    cell_ids[valid] = ang2pix(2**shard.healpix_level, thetas, phis, nest=True)
+    return np.flatnonzero((cell_ids >= shard.cell_start) & (cell_ids < shard.cell_end))
 
 
 def build_local_healpix_cell_splits(

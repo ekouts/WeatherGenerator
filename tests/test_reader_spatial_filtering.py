@@ -9,7 +9,7 @@
 
 """Reader-boundary early filtering vs the tokenizer's late filtering.
 
-The pure tests validate that `HealpixDomain.grid_point_rows` selects exactly the
+The pure tests validate that `shard_grid_point_rows` selects exactly the
 rows the tokenizer's late HEALPix selection would keep. The dataset tests compare
 a full-read `DataReaderAnemoi` (the oracle) against per-rank early-filtering
 readers on a local Anemoi ERA5 O96 store; they are skipped when the store is
@@ -23,10 +23,11 @@ import pytest
 from omegaconf import OmegaConf
 
 from weathergen.datasets.healpix_domain import (
-    HealpixDomain,
     build_local_healpix_cell_splits,
+    shard_grid_point_rows,
     theta_phi_to_standard_coords,
 )
+from weathergen.utils.spatial_shard import SpatialShard
 
 HEALPIX_LEVEL = 5
 NUM_CELLS = 12 * 4**HEALPIX_LEVEL
@@ -40,12 +41,8 @@ needs_o96 = pytest.mark.skipif(
 )
 
 
-def _domains(spatial_size: int) -> list[HealpixDomain]:
-    cells_per_rank = NUM_CELLS // spatial_size
-    return [
-        HealpixDomain(HEALPIX_LEVEL, rank * cells_per_rank, (rank + 1) * cells_per_rank)
-        for rank in range(spatial_size)
-    ]
+def _domains(spatial_size: int) -> list[SpatialShard]:
+    return [SpatialShard(HEALPIX_LEVEL, spatial_size, rank) for rank in range(spatial_size)]
 
 
 def _random_coords(num_points: int, seed: int) -> np.ndarray:
@@ -64,7 +61,7 @@ def test_grid_point_rows_matches_tokenizer_cell_assignment():
     cell_ids = ang2pix(2**HEALPIX_LEVEL, thetas, phis, nest=True)
 
     for domain in _domains(SPATIAL_SIZE):
-        rows = domain.grid_point_rows(coords[:, 0], coords[:, 1])
+        rows = shard_grid_point_rows(domain, coords[:, 0], coords[:, 1])
         late_splits = build_local_healpix_cell_splits(
             cell_ids, NUM_CELLS, domain.cell_start, domain.cell_end
         )
@@ -74,7 +71,9 @@ def test_grid_point_rows_matches_tokenizer_cell_assignment():
 
 def test_grid_point_rows_disjoint_partition():
     coords = _random_coords(10_000, seed=11)
-    all_rows = [d.grid_point_rows(coords[:, 0], coords[:, 1]) for d in _domains(SPATIAL_SIZE)]
+    all_rows = [
+        shard_grid_point_rows(d, coords[:, 0], coords[:, 1]) for d in _domains(SPATIAL_SIZE)
+    ]
     union = np.sort(np.concatenate(all_rows))
     np.testing.assert_array_equal(union, np.arange(len(coords)))
 
@@ -86,16 +85,18 @@ def test_grid_point_rows_excludes_nan_coordinates():
     coords[::11, 1] = np.nan
     finite = np.flatnonzero(np.isfinite(coords).all(axis=1))
 
-    all_rows = [d.grid_point_rows(coords[:, 0], coords[:, 1]) for d in _domains(SPATIAL_SIZE)]
+    all_rows = [
+        shard_grid_point_rows(d, coords[:, 0], coords[:, 1]) for d in _domains(SPATIAL_SIZE)
+    ]
     union = np.sort(np.concatenate(all_rows))
     np.testing.assert_array_equal(union, finite)
 
 
-def test_healpix_domain_rejects_invalid_range():
-    with pytest.raises(ValueError, match="invalid HEALPix cell range"):
-        HealpixDomain(HEALPIX_LEVEL, 0, NUM_CELLS + 1)
-    with pytest.raises(ValueError, match="invalid HEALPix cell range"):
-        HealpixDomain(HEALPIX_LEVEL, 7, 7)
+def test_spatial_shard_rejects_invalid_configuration():
+    with pytest.raises(ValueError, match="spatial_rank"):
+        SpatialShard(HEALPIX_LEVEL, SPATIAL_SIZE, SPATIAL_SIZE)
+    with pytest.raises(ValueError, match="divisible"):
+        SpatialShard(HEALPIX_LEVEL, 5, 0)
 
 
 @pytest.fixture(scope="module")
@@ -112,13 +113,13 @@ def o96_readers():
     )
     stream_info = OmegaConf.create({"name": "era5_o96_test", "type": "anemoi"})
 
-    def make_reader(domain: HealpixDomain | None) -> DataReaderAnemoi:
+    def make_reader(domain: SpatialShard | None) -> DataReaderAnemoi:
         return DataReaderAnemoi(
             tw_handler=tw_handler,
             filename=O96_ZARR,
             stream_info=stream_info,
             stage="train",
-            healpix_domain=domain,
+            spatial_shard=domain,
         )
 
     full = make_reader(None)
@@ -163,7 +164,7 @@ def test_early_filtered_sources_reassemble_to_full_read(o96_readers, window_idx)
 def test_legacy_get_signature_subclass_still_works(o96_readers):
     """Subclasses overriding _get without grid_rows (e.g. anemoi_operan) must not break.
 
-    They never receive a healpix_domain, so get_source must call _get with the
+    They never receive a spatial_shard, so get_source must call _get with the
     legacy two-argument form for them.
     """
     from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
@@ -216,7 +217,7 @@ def test_operan_reader_filters_sources(o96_readers):
             filename=O96_ZARR,
             stream_info=stream_info,
             stage="train",
-            healpix_domain=domain,
+            spatial_shard=domain,
         )
 
     idx = np.int64(2)  # >= 1: operan prepends one earlier timestep

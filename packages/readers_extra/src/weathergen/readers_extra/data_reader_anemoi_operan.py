@@ -19,8 +19,8 @@ from weathergen.datasets.data_reader_base import (
     TimeWindowHandler,
     TIndex,
 )
-from weathergen.datasets.healpix_domain import HealpixDomain
 from weathergen.train.utils import Stage
+from weathergen.utils.spatial_shard import SpatialShard
 
 
 def dt2cal(dt):
@@ -63,7 +63,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
         filename: Path,
         stream_info: dict,
         stage: Stage,
-        healpix_domain: HealpixDomain | None = None,
+        spatial_shard: SpatialShard | None = None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -74,7 +74,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
             filename (and path) of dataset
         stream_info :
             information about stream
-        healpix_domain :
+        spatial_shard :
             when set, source reads return only grid rows in this rank's HEALPix
             cell range; targets remain global. Rows with NaN coordinates (e.g.
             off-disk geostationary pixels) belong to no rank and are dropped at
@@ -85,7 +85,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
         None
         """
 
-        super().__init__(tw_handler, filename, stream_info, stage, healpix_domain)
+        super().__init__(tw_handler, filename, stream_info, stage, spatial_shard)
 
     @override
     def _get(

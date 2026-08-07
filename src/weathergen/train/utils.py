@@ -18,10 +18,11 @@ from weathergen.common import config
 from weathergen.common.config import Config, merge_configs
 
 # Run stages
-Stage = Literal["train", "val", "test"]
+Stage = Literal["train", "val", "test", "system"]
 TRAIN: Stage = "train"
 VAL: Stage = "val"
 TEST: Stage = "test"
+SYSTEM: Stage = "system"
 
 # keys to filter using enabled: True/False
 cfg_keys_to_filter = ["losses", "model_input", "target_input"]

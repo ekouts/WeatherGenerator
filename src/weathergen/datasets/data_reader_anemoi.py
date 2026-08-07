@@ -26,9 +26,10 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     check_reader_data,
 )
-from weathergen.datasets.healpix_domain import HealpixDomain
+from weathergen.datasets.healpix_domain import shard_grid_point_rows
 from weathergen.train.utils import Stage
 from weathergen.utils.distributed import is_root
+from weathergen.utils.spatial_shard import SpatialShard
 
 _logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         filename: Path,
         stream_info: dict,
         stage: Stage,
-        healpix_domain: HealpixDomain | None = None,
+        spatial_shard: SpatialShard | None = None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -53,7 +54,7 @@ class DataReaderAnemoi(DataReaderTimestep):
             filename (and path) of dataset
         stream_info :
             information about stream
-        healpix_domain :
+        spatial_shard :
             when set, source reads return only grid rows in this rank's HEALPix
             cell range; targets remain global
 
@@ -62,7 +63,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         None
         """
 
-        self.healpix_domain = healpix_domain
+        self.spatial_shard = spatial_shard
         # Global grid-row indices owned by this rank; None means no filtering.
         self.local_grid_rows: NDArray[np.int64] | None = None
 
@@ -132,13 +133,15 @@ class DataReaderAnemoi(DataReaderTimestep):
         # Anemoi fixed grids expose one lat/lon per grid row for the whole dataset,
         # so the rank-local row selection is computed once here and reused for
         # every window in _get.
-        if healpix_domain is not None:
-            self.local_grid_rows = healpix_domain.grid_point_rows(self.latitudes, self.longitudes)
+        if spatial_shard is not None:
+            self.local_grid_rows = shard_grid_point_rows(
+                spatial_shard, self.latitudes, self.longitudes
+            )
             ds_name = stream_info["name"]
             _logger.info(
                 f"{ds_name}: reader spatial filtering active, rank owns "
                 f"{len(self.local_grid_rows)}/{len(self.latitudes)} grid rows "
-                f"(cells [{healpix_domain.cell_start}, {healpix_domain.cell_end}))"
+                f"(cells [{spatial_shard.cell_start}, {spatial_shard.cell_end}))"
             )
 
         # select/filter requested source channels
