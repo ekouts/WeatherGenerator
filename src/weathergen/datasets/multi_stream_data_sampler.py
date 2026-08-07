@@ -623,6 +623,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].source_idx]),
+                    self.rng,
                 )
                 rdata.is_spoof = True
 
@@ -645,6 +646,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].target_idx]),
+                    self.rng,
                 )
                 rdata.is_spoof = True
 
@@ -722,6 +724,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             num_target_samples,
             self.output_offset,
             num_output_steps,
+            temporal_index=idx,
         )
 
         # for all streams

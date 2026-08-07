@@ -62,3 +62,8 @@ def get_train_metrics_path(base_path: Path, run_id: str) -> Path:
         return base_path / run_id / "metrics.json"
     else:
         return base_path / f"{run_id}_train_metrics.json"
+
+
+def get_diagnostic_metrics_path(base_path: Path, run_id: str, rank: int) -> Path:
+    """Return the rank-sharded diagnostic timeline path for a training run."""
+    return base_path / f"{run_id}_diagnostic_rank{rank:04d}.json"
