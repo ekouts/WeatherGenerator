@@ -210,6 +210,11 @@ class DataReaderAnemoi(DataReaderTimestep):
         feed the still-global loss, while non-local source rows would be dropped
         by the tokenizer anyway.
         """
+        if self.local_grid_rows is None:
+            # Subclasses (e.g. DataReaderAnemoiOperan) override _get without the
+            # grid_rows parameter; they never receive a domain, so keep the
+            # legacy call for them and for unfiltered readers.
+            return self._get(idx, self.source_idx)
         return self._get(idx, self.source_idx, grid_rows=self.local_grid_rows)
 
     @override
