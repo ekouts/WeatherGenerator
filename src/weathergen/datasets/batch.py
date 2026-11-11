@@ -16,6 +16,20 @@ import torch
 from weathergen.common.config import Config
 from weathergen.datasets.stream_data import StreamData
 
+# alignment of the tensors inside a packed buffer; covers every torch dtype (max. 16 bytes)
+_PACK_ALIGNMENT = 16
+
+
+def _is_packable(tensor) -> bool:
+    """True for the tensors that ModelBatch.pack() moves into the packed buffer."""
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.device.type == "cpu"
+        and tensor.layout == torch.strided
+        and tensor.numel() > 0
+        and not tensor.requires_grad
+    )
+
 
 @dataclass
 class SampleMetaData:
@@ -99,6 +113,17 @@ class Sample:
                     include_target_coords,
                     include_target_tokens,
                 )
+
+    def device_slots(self) -> list[tuple[list | dict, int | str]]:
+        """
+        Where the tensors that to_device() moves by default are stored, as (container, key)
+        pairs: container[key] reads the tensor and can be assigned to replace it.
+        """
+        slots = [(meta_data.__dict__, "mask") for meta_data in self.meta_info.values()]
+        for stream_data in self.streams_data.values():
+            if stream_data is not None:
+                slots.extend(stream_data.device_slots())
+        return slots
 
     def clear_target_coordinates(self, target_steps: list[int]) -> None:
         for stream_data in self.streams_data.values():
@@ -230,6 +255,14 @@ class BatchSamples:
         self.device = device
 
         return self
+
+    def device_slots(self) -> list[tuple[list | dict, int | str]]:
+        """
+        Where the tensors that to_device() moves by default are stored, see Sample.device_slots()
+        """
+        slots = [slot for sample in self.samples for slot in sample.device_slots()]
+        slots.append((self.__dict__, "tokens_lens"))
+        return slots
 
     def clear_target_coordinates(self, target_steps: list[int]) -> None:
         for sample in self.samples:
@@ -365,6 +398,9 @@ class ModelBatch:
     # device of the tensors in the batch
     device: str | torch.device
 
+    # buffer that holds all tensors of the batch after pack(), None if not packed
+    packed_buffer: torch.Tensor | None
+
     def __init__(
         self,
         stream_names: list[str],
@@ -389,6 +425,8 @@ class ModelBatch:
 
         self.source2target_matching_idxs = np.full(num_source_samples, -1, dtype=np.int32)
         self.target2source_matching_idxs = [[] for _ in range(num_target_samples)]
+
+        self.packed_buffer = None
 
     def set_source_target_matching(self, source_to_target: np.typing.NDArray) -> None:
         """
@@ -421,6 +459,10 @@ class ModelBatch:
     def pin_memory(self):
         """Pin all tensors in this batch to CPU pinned memory"""
 
+        if self.packed_buffer is not None:
+            self.packed_buffer = self._move_packed(lambda t: t.pin_memory())
+            return self
+
         # pin source samples
         self.source_samples.pin_memory()
 
@@ -429,13 +471,98 @@ class ModelBatch:
 
         return self
 
+    def pack(self):  # -> ModelBatch
+        """
+        Copy all tensors that to_device() moves into one buffer and replace them by views of it.
+
+        A packed batch is transferred to the device with one host-to-device copy instead of one
+        per tensor. Call it in the DataLoader worker: the buffer is allocated in shared memory,
+        so sending the batch to the main process does not copy it again, and the main process
+        maps and unmaps one segment per batch.
+
+        The tensors on the device are then views of one allocation, which is only freed when
+        the last of them is released.
+        """
+
+        slots = self.source_samples.device_slots() + self.target_samples.device_slots()
+
+        # layout: offset of each distinct tensor in the buffer
+        tensors = {}
+        num_bytes = 0
+        for container, key in slots:
+            tensor = container[key]
+            if _is_packable(tensor) and id(tensor) not in tensors:
+                tensors[id(tensor)] = (tensor, num_bytes)
+                size = tensor.numel() * tensor.element_size()
+                num_bytes += -(-size // _PACK_ALIGNMENT) * _PACK_ALIGNMENT
+
+        if num_bytes == 0:
+            return self
+
+        # torch has no public function to allocate in shared memory without copying;
+        # default_collate uses the same call for its output buffer
+        storage = torch.UntypedStorage._new_shared(num_bytes)  # pylint: disable=protected-access
+        buffer = torch.empty(0, dtype=torch.uint8).set_(storage)
+
+        views = {}
+        for tensor_id, (tensor, offset) in tensors.items():
+            size = tensor.numel() * tensor.element_size()
+            view = buffer[offset : offset + size].view(tensor.dtype).view(tensor.shape)
+            view.copy_(tensor)
+            views[tensor_id] = view
+
+        for container, key in slots:
+            view = views.get(id(container[key]))
+            if view is not None:
+                container[key] = view
+
+        self.packed_buffer = buffer
+
+        return self
+
+    def _move_packed(self, move: typing.Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        """
+        Apply move (e.g. the transfer to a device) once to the packed buffer and replace the
+        tensors of the batch by views of the result. Tensors that are not views of the packed
+        buffer are moved one by one. Returns the moved buffer.
+        """
+
+        buffer = self.packed_buffer
+        buffer_ptr = buffer.untyped_storage().data_ptr()
+        moved = move(buffer)
+
+        slots = self.source_samples.device_slots() + self.target_samples.device_slots()
+        for container, key in slots:
+            tensor = container[key]
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if (
+                _is_packable(tensor)
+                and tensor.is_contiguous()
+                and tensor.untyped_storage().data_ptr() == buffer_ptr
+            ):
+                offset = tensor.storage_offset() * tensor.element_size()
+                size = tensor.numel() * tensor.element_size()
+                container[key] = moved[offset : offset + size].view(tensor.dtype).view(tensor.shape)
+            else:
+                container[key] = move(tensor)
+
+        return moved
+
     def to_device(self, device):  # -> ModelBatch
         """
         Move batch to device
         """
 
-        self.source_samples.to_device(device)
-        self.target_samples.to_device(device)
+        if self.packed_buffer is not None:
+            # one copy for the whole batch, see pack()
+            self._move_packed(lambda t: t.to(device, non_blocking=True))
+            self.packed_buffer = None
+            self.source_samples.device = device
+            self.target_samples.device = device
+        else:
+            self.source_samples.to_device(device)
+            self.target_samples.to_device(device)
 
         self.device = device
 

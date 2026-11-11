@@ -174,6 +174,32 @@ class StreamData:
 
         return self
 
+    def device_slots(self) -> list[tuple[list, int]]:
+        """
+        Where the tensors that to_device() moves by default are stored.
+
+        Returns
+        -------
+        list[tuple[list, int]]
+            One (list, index) pair per tensor, so that it can be read and replaced in place.
+        """
+        slots = []
+        for step in range(self.output_steps):
+            slots.append((self.target_coords, step))
+            slots.append((self.target_coords_lens, step))
+            slots.append((self.target_tokens, step))
+
+        # same condition as in to_device(): sources are only moved if present
+        if not np.array([s is None for s in self.source_tokens_cells]).all():
+            for tensors in (
+                self.source_tokens_cells,
+                self.source_tokens_lens,
+                self.source_idxs_embed,
+            ):
+                slots.extend((tensors, i) for i in range(len(tensors)))
+
+        return slots
+
     def clear_target_coordinates(self, target_steps: list[int]) -> None:
         """Release decoder coordinates for forecast steps that have been processed."""
         for step in target_steps:

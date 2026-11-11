@@ -947,6 +947,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 else:
                     break
 
+            # one buffer for all tensors, so that the batch is moved to the device with one copy
+            batch.pack()
+
             yield batch
 
     def __len__(self):
